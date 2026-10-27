@@ -2,6 +2,10 @@
 import { CurrencyCode, LanguageCode } from '@vendure/common/lib/generated-types';
 import { Customer, EntityHydrator, mergeConfig, OrderService, TransactionalConnection } from '@vendure/core';
 import {
+    OrderStateTransitionError,
+    PaymentFailedError,
+} from '@vendure/core/dist/common/error/generated-graphql-shop-errors';
+import {
     createProductDocument,
     createProductVariantsDocument,
     testCreateStockLocationDocument,
@@ -16,6 +20,7 @@ import nock from 'nock';
 import fetch from 'node-fetch';
 import path from 'path';
 import { Stripe } from 'stripe';
+import { SelectQueryBuilder } from 'typeorm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
@@ -56,6 +61,39 @@ describe('Stripe payments', () => {
     const orderGuard: ErrorResultGuard<FragmentOf<typeof testOrderFragment>> = createErrorResultGuard(
         input => !!input.lines,
     );
+
+    async function postSucceededWebhook(
+        currentOrder: Pick<FragmentOf<typeof testOrderFragment>, 'id' | 'code' | 'totalWithTax'>,
+        paymentIntentId: string,
+    ) {
+        const payload = JSON.stringify({
+            id: `evt_${paymentIntentId}`,
+            object: 'event',
+            api_version: '2022-11-15',
+            type: 'payment_intent.succeeded',
+            data: {
+                object: {
+                    id: paymentIntentId,
+                    currency: 'usd',
+                    status: 'succeeded',
+                    amount_received: currentOrder.totalWithTax,
+                    metadata: {
+                        orderCode: currentOrder.code,
+                        orderId: currentOrder.id.replace('T_', ''),
+                        channelToken: E2E_DEFAULT_CHANNEL_TOKEN,
+                    },
+                },
+            },
+        });
+        const signature = new Stripe('test-api-secret', { apiVersion: '2023-08-16' })
+            .webhooks.generateTestHeaderString({ payload, secret: 'test-signing-secret' });
+        return fetch(`http://localhost:${serverPort}/payments/stripe`, {
+            method: 'post',
+            body: payload,
+            headers: { 'Content-Type': 'application/json', 'Stripe-Signature': signature },
+        });
+    }
+
     beforeAll(async () => {
         serverPort = devConfig.apiOptions.port;
         await server.init({
@@ -590,6 +628,7 @@ describe('Stripe payments', () => {
         });
         orderGuard.assertSuccess(concurrentOrder);
         await setShipping(shopClient);
+        const { activeOrder: concurrentOrderWithShipping } = await shopClient.query(getActiveOrderDocument);
 
         const MOCKED_WEBHOOK_PAYLOAD = {
             id: 'evt_concurrent',
@@ -604,7 +643,7 @@ describe('Stripe payments', () => {
                         orderId: parseInt(concurrentOrder.id.replace('T_', ''), 10),
                         channelToken: E2E_DEFAULT_CHANNEL_TOKEN,
                     },
-                    amount_received: concurrentOrder.totalWithTax,
+                    amount_received: concurrentOrderWithShipping!.totalWithTax,
                     status: 'succeeded',
                 },
             },
@@ -685,10 +724,83 @@ describe('Stripe payments', () => {
                 payment => payment.transactionId === 'pi_concurrent',
             );
             expect(paymentsForIntent.length).toEqual(1);
+            expect(orderWithPayments!.state).toEqual('PaymentSettled');
         } finally {
             addPaymentSpy.mockRestore();
         }
     });
+
+    it('Should acquire the order lock before reading order state', async () => {
+        const orderService = server.app.get(OrderService);
+        const lockSpy = vi.spyOn(SelectQueryBuilder.prototype, 'setLock');
+        const lookupSpy = vi.spyOn(orderService, 'findOneByCode');
+        try {
+            const result = await postSucceededWebhook(order, 'pi_0');
+            expect(result.status).toEqual(200);
+            expect(lockSpy).toHaveBeenCalledWith('pessimistic_write');
+            expect(lookupSpy).toHaveBeenCalled();
+            expect(lockSpy.mock.invocationCallOrder[0]).toBeLessThan(
+                lookupSpy.mock.invocationCallOrder[0],
+            );
+        } finally {
+            lockSpy.mockRestore();
+            lookupSpy.mockRestore();
+        }
+    });
+
+    it.each(['lock acquisition', 'state transition', 'payment creation'])(
+        'Should return 500 on failed %s and settle exactly once on redelivery',
+        async failureStage => {
+            await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
+            const { addItemToOrder: retryOrder } = await shopClient.query(addItemToOrderDocument, {
+                productVariantId: 'T_1',
+                quantity: 1,
+            });
+            orderGuard.assertSuccess(retryOrder);
+            await setShipping(shopClient);
+            const { activeOrder } = await shopClient.query(getActiveOrderDocument);
+            orderGuard.assertSuccess(activeOrder!);
+            const paymentIntentId = `pi_retry_${failureStage.replaceAll(' ', '_')}`;
+            const orderService = server.app.get(OrderService);
+            const failureSpy =
+                failureStage === 'lock acquisition'
+                    ? vi.spyOn(SelectQueryBuilder.prototype, 'setLock').mockImplementationOnce(() => {
+                          throw new Error('Simulated database lock failure');
+                      })
+                    : failureStage === 'state transition'
+                      ? vi.spyOn(orderService, 'transitionToState').mockResolvedValue(
+                            new OrderStateTransitionError({
+                                fromState: 'AddingItems',
+                                toState: 'ArrangingPayment',
+                                transitionError: 'Simulated transition failure',
+                            }),
+                        )
+                      : vi.spyOn(orderService, 'addPaymentToOrder').mockResolvedValue(
+                            new PaymentFailedError({ paymentErrorMessage: 'Simulated settlement failure' }),
+                        );
+
+            try {
+                const failedDelivery = await postSucceededWebhook(activeOrder, paymentIntentId);
+                expect(failedDelivery.status).toEqual(500);
+                const { order: failedOrder } = await adminClient.query(getOrderPaymentsDocument, {
+                    id: retryOrder.id,
+                });
+                expect(failedOrder!.state).toEqual(activeOrder.state);
+                expect(failedOrder!.payments).toHaveLength(0);
+            } finally {
+                failureSpy.mockRestore();
+            }
+
+            expect((await postSucceededWebhook(activeOrder, paymentIntentId)).status).toEqual(200);
+            expect((await postSucceededWebhook(activeOrder, paymentIntentId)).status).toEqual(200);
+            const { order: settledOrder } = await adminClient.query(getOrderPaymentsDocument, {
+                id: retryOrder.id,
+            });
+            expect(settledOrder!.state).toEqual('PaymentSettled');
+            expect(settledOrder!.payments!.filter(payment => payment.transactionId === paymentIntentId))
+                .toHaveLength(1);
+        },
+    );
 
     // https://github.com/vendurehq/vendure/issues/3249
     it('Should skip events without expected metadata, when the plugin option is set', async () => {

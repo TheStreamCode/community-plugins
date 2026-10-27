@@ -15,6 +15,7 @@ import {
 import { OrderStateTransitionError } from '@vendure/core/dist/common/error/generated-graphql-shop-errors';
 import type { Response } from 'express';
 import type Stripe from 'stripe';
+import { LockNotSupportedOnGivenDriverError } from 'typeorm';
 
 import { loggerCtx, STRIPE_PLUGIN_OPTIONS } from './constants';
 import { isExpectedVendureStripeEventMetadata } from './stripe-utils';
@@ -114,20 +115,9 @@ export class StripeController {
         const releaseSettlementLock = await this.acquireOrderSettlementLock(orderCode);
         await this.connection
             .withTransaction(outerCtx, async (ctx: RequestContext) => {
-            const order = await this.orderService.findOneByCode(ctx, orderCode);
-
-            if (!order) {
-                throw new Error(
-                    `Unable to find order ${orderCode}, unable to settle payment ${paymentIntent.id}!`,
-                );
-            }
-
-            // Serialize settlement for this order across processes: without a
-            // lock, two overlapping deliveries can both pass the idempotency
-            // check below and settle twice. SQLite-family drivers do not
-            // support pessimistic locks, so this degrades gracefully there —
-            // same-process overlap on those drivers is serialized by the
-            // in-process mutex instead (see acquireOrderSettlementLock).
+            // Lock before the first read: under REPEATABLE READ, an earlier
+            // order lookup would pin a snapshot that misses payments committed
+            // by another delivery while this one waits for the lock.
             try {
                 await this.connection
                     .getRepository(ctx, Order)
@@ -135,8 +125,20 @@ export class StripeController {
                     .setLock('pessimistic_write')
                     .where('order.id = :orderId', { orderId })
                     .getOne();
-            } catch {
-                // Lock not supported (e.g. SQLite) — continue without it
+            } catch (error) {
+                // SQLite uses the in-process mutex; database failures on
+                // drivers with row locks must propagate so Stripe retries.
+                if (!(error instanceof LockNotSupportedOnGivenDriverError)) {
+                    throw error;
+                }
+            }
+
+            const order = await this.orderService.findOneByCode(ctx, orderCode);
+
+            if (!order) {
+                throw new Error(
+                    `Unable to find order ${orderCode}, unable to settle payment ${paymentIntent.id}!`,
+                );
             }
 
             // The secret was resolved without the order; run the unchanged
