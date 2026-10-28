@@ -604,6 +604,43 @@ describe('Mollie payments', () => {
             );
         });
 
+        it('Retains the error when an unplaced cancelled order receives an unrecorded payment', async () => {
+            // Keep coverage for orders cancelled before placement, which bypass the duplicate-payment check.
+            await shopClient.asUserWithCredentials(customers[0].emailAddress, 'test');
+            const { addItemToOrder: unpaidOrder } = await shopClient.query(addItemToOrderDocument, {
+                productVariantId: 'T_1',
+                quantity: 1,
+            });
+            const { cancelOrder } = await adminClient.query(cancelOrderDocument, {
+                input: { orderId: unpaidOrder.id },
+            });
+            expect(cancelOrder.state).toBe('Cancelled');
+            expect(cancelOrder.orderPlacedAt).toBeNull();
+            expect(cancelOrder.payments).toEqual([]);
+            const errorLogSpy = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
+            onTestFinished(() => errorLogSpy.mockRestore());
+            nock('https://api.mollie.com/')
+                .get('/v2/payments/tr_unrecorded')
+                .reply(200, {
+                    ...mollieMockData.molliePaymentResponse,
+                    id: 'tr_unrecorded',
+                    description: unpaidOrder.code,
+                    status: OrderStatus.paid,
+                });
+            const response = await fetch(
+                `http://localhost:${serverPort}/payments/mollie/${E2E_DEFAULT_CHANNEL_TOKEN}/1`,
+                {
+                    method: 'post',
+                    body: JSON.stringify({ id: 'tr_unrecorded' }),
+                    headers: { 'Content-Type': 'application/json' },
+                },
+            );
+            expect(response.ok).toBe(true);
+            expect(errorLogSpy).toHaveBeenCalledWith(
+                `Order '${unpaidOrder.code}' is 'Cancelled', but was paid for with 'tr_unrecorded'. Payment 'tr_unrecorded' should be refunded.`,
+                'MolliePlugin',
+            );
+        });
     });
 
     describe('Handle pay-later with manual capture', () => {
