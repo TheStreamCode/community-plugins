@@ -42,7 +42,13 @@ import {
     MolliePaymentMethod,
 } from './graphql/generated-shop-types';
 import { molliePaymentHandler } from './mollie.handler';
-import { amountToCents, toAmount, toMollieAddress, toMolliePaymentLines } from './mollie.helpers';
+import {
+    amountToCents,
+    getMoneyPrecision,
+    toAmount,
+    toMollieAddress,
+    toMolliePaymentLines,
+} from './mollie.helpers';
 import { MolliePluginOptions } from './mollie.plugin';
 import { MolliePaymentMetadata } from './types';
 
@@ -218,14 +224,15 @@ export class MollieService {
                 loggerCtx,
             );
         }
+        const precision = getMoneyPrecision(this.configService);
         const paymentInput: CreatePaymentParameters = {
             description: order.code,
-            amount: toAmount(amountToPay, order.currencyCode),
+            amount: toAmount(amountToPay, order.currencyCode, precision),
             redirectUrl,
             webhookUrl: `${vendureHost}/payments/mollie/${ctx.channel.token}/${paymentMethod.id}`,
             billingAddress,
             locale: input.locale as Locale,
-            lines: toMolliePaymentLines(order, alreadyPaid),
+            lines: toMolliePaymentLines(order, alreadyPaid, precision),
             metadata: {
                 languageCode: ctx.languageCode,
                 immediateCapture,
@@ -329,7 +336,7 @@ export class MollieService {
             );
             return order;
         }
-        const amount = amountToCents(molliePayment.amount);
+        const amount = amountToCents(molliePayment.amount, getMoneyPrecision(this.configService));
         // Metadata to add to a payment
         const mollieMetadata: Omit<MolliePaymentMetadata, 'status' | 'amount'> = {
             paymentId: molliePayment.id,
