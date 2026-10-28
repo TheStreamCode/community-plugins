@@ -3,6 +3,16 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## 2.0.1 (2026-10-28)
+
+### Bug Fixes
+
+* **elasticsearch-plugin:** log index failures once, at the caller
+* **elasticsearch-plugin:** avoid query strategy relation load failure
+* **elasticsearch-plugin:** don't strand temp index or abort bootstrap on create failure
+* **elasticsearch-plugin:** load indexing relations with the query strategy
+* **elasticsearch-plugin:** remove dead health check code ([#42](https://github.com/vendurehq/community-plugins/pull/42))
+
 ## 2.0.0
 
 ### Features
