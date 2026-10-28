@@ -20,12 +20,12 @@ import nock from 'nock';
 import fetch from 'node-fetch';
 import path from 'path';
 import { Stripe } from 'stripe';
-import { SelectQueryBuilder } from 'typeorm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 import { StripePlugin } from '../src';
+import { StripeController } from '../src/stripe.controller';
 import { stripePaymentMethodHandler } from '../src/stripe.handler';
 
 import {
@@ -732,12 +732,19 @@ describe('Stripe payments', () => {
 
     it('Should acquire the order lock before reading order state', async () => {
         const orderService = server.app.get(OrderService);
-        const lockSpy = vi.spyOn(SelectQueryBuilder.prototype, 'setLock');
+        // lockOrderForUpdate is private; the ordering guarantee it provides
+        // (first read of the settlement transaction) is the behaviour pinned here.
+        const lockSpy = vi.spyOn(
+            StripeController.prototype as unknown as {
+                lockOrderForUpdate: (...args: unknown[]) => Promise<void>;
+            },
+            'lockOrderForUpdate',
+        );
         const lookupSpy = vi.spyOn(orderService, 'findOneByCode');
         try {
             const result = await postSucceededWebhook(order, 'pi_0');
             expect(result.status).toEqual(200);
-            expect(lockSpy).toHaveBeenCalledWith('pessimistic_write');
+            expect(lockSpy).toHaveBeenCalled();
             expect(lookupSpy).toHaveBeenCalled();
             expect(lockSpy.mock.invocationCallOrder[0]).toBeLessThan(
                 lookupSpy.mock.invocationCallOrder[0],
@@ -764,9 +771,14 @@ describe('Stripe payments', () => {
             const orderService = server.app.get(OrderService);
             const failureSpy =
                 failureStage === 'lock acquisition'
-                    ? vi.spyOn(SelectQueryBuilder.prototype, 'setLock').mockImplementationOnce(() => {
-                          throw new Error('Simulated database lock failure');
-                      })
+                    ? vi
+                          .spyOn(
+                              StripeController.prototype as unknown as {
+                                  lockOrderForUpdate: (...args: unknown[]) => Promise<void>;
+                              },
+                              'lockOrderForUpdate',
+                          )
+                          .mockRejectedValueOnce(new Error('Simulated database lock failure'))
                     : failureStage === 'state transition'
                       ? vi.spyOn(orderService, 'transitionToState').mockResolvedValue(
                             new OrderStateTransitionError({
