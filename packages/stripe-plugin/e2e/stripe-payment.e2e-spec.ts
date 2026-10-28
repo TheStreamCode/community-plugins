@@ -558,6 +558,91 @@ describe('Stripe payments', () => {
         expect(result.status).toEqual(200);
     });
 
+    // https://github.com/vendurehq/community-plugins/issues/59
+    describe('events whose object has no metadata', () => {
+        // The object of a `balance.available` event is a Balance, which has no `metadata` field at all.
+        const postBalanceEvent = async (objectOverrides: Record<string, unknown>) => {
+            const MOCKED_WEBHOOK_PAYLOAD = {
+                id: 'evt_balance',
+                object: 'event',
+                api_version: '2022-11-15',
+                data: {
+                    object: {
+                        object: 'balance',
+                        available: [{ amount: 0, currency: 'usd' }],
+                        livemode: false,
+                        pending: [{ amount: 0, currency: 'usd' }],
+                        ...objectOverrides,
+                    },
+                },
+                livemode: false,
+                pending_webhooks: 1,
+                request: {
+                    id: null,
+                    idempotency_key: null,
+                },
+                type: 'balance.available',
+            };
+
+            const payloadString = JSON.stringify(MOCKED_WEBHOOK_PAYLOAD, null, 2);
+            const stripeWebhooks = new Stripe('test-api-secret', { apiVersion: '2023-08-16' }).webhooks;
+            const header = stripeWebhooks.generateTestHeaderString({
+                payload: payloadString,
+                secret: 'test-signing-secret',
+            });
+
+            return fetch(`http://localhost:${serverPort}/payments/stripe`, {
+                method: 'post',
+                body: payloadString,
+                headers: { 'Content-Type': 'application/json', 'Stripe-Signature': header },
+            });
+        };
+
+        const withSkipOption = async (skip: boolean, run: () => Promise<void>) => {
+            const previous = StripePlugin.options.skipPaymentIntentsWithoutExpectedMetadata;
+            StripePlugin.options.skipPaymentIntentsWithoutExpectedMetadata = skip;
+            try {
+                await run();
+            } finally {
+                StripePlugin.options.skipPaymentIntentsWithoutExpectedMetadata = previous;
+            }
+        };
+
+        it('Should skip events without a metadata field, when the plugin option is set', async () => {
+            await withSkipOption(true, async () => {
+                const result = await postBalanceEvent({});
+
+                expect(result.status).toEqual(200);
+                expect(await result.text()).toEqual('Event has no Vendure metadata, skipped.');
+            });
+        });
+
+        it('Should skip events with null metadata, when the plugin option is set', async () => {
+            await withSkipOption(true, async () => {
+                const result = await postBalanceEvent({ metadata: null });
+
+                expect(result.status).toEqual(200);
+                expect(await result.text()).toEqual('Event has no Vendure metadata, skipped.');
+            });
+        });
+
+        it('Should reject instead of skipping events without expected metadata, when the plugin option is not set', async () => {
+            await withSkipOption(false, async () => {
+                const incomplete = await postBalanceEvent({ metadata: { dummy: 'not a vendure payload' } });
+                const missing = await postBalanceEvent({});
+                const nullMetadata = await postBalanceEvent({ metadata: null });
+
+                expect(incomplete.status).toEqual(500);
+                expect(missing.status).toEqual(500);
+                expect(nullMetadata.status).toEqual(500);
+
+                const { statusCode, message } = (await incomplete.json()) as { statusCode: number; message: string };
+                expect(await missing.json()).toMatchObject({ statusCode, message });
+                expect(await nullMetadata.json()).toMatchObject({ statusCode, message });
+            });
+        });
+    });
+
     // https://github.com/vendurehq/vendure/issues/1630
     describe('currencies with no fractional units', () => {
         let japanProductId: string;

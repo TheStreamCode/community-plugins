@@ -41,14 +41,17 @@ function currencyHasFractionPart(currencyCode: CurrencyCode): boolean {
  *
  * @description
  * Ensures that the payment intent metadata object contains the expected properties, as defined by the plugin.
+ * Events whose object has no `metadata` at all (e.g. a Balance) are reported as not expected rather than throwing.
  */
-export function isExpectedVendureStripeEventMetadata(metadata: Stripe.Metadata): metadata is {
+export function isExpectedVendureStripeEventMetadata(
+    metadata: Stripe.Metadata | null | undefined,
+): metadata is {
     channelToken: string;
     orderCode: string;
     orderId: string;
     languageCode: LanguageCode;
 } {
-    return !!metadata.channelToken && !!metadata.orderCode && !!metadata.orderId;
+    return !!metadata && !!metadata.channelToken && !!metadata.orderCode && !!metadata.orderId;
 }
 
 /**
