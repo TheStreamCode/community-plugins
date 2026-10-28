@@ -306,10 +306,10 @@ export class MollieService {
             );
             return order;
         }
+        const paymentWithSameTransactionId = order.payments.find(
+            p => p.transactionId === molliePayment.id,
+        );
         if (order.orderPlacedAt) {
-            const paymentWithSameTransactionId = order.payments.find(
-                p => p.transactionId === molliePayment.id,
-            );
             if (!paymentWithSameTransactionId) {
                 // The order is paid for again, with another transaction ID. This means the customer paid twice
                 Logger.error(
@@ -319,16 +319,17 @@ export class MollieService {
                 return order;
             }
         }
-        if (order.state === 'Cancelled' && molliePayment.status === PaymentStatus.paid) {
+        if (
+            order.state === 'Cancelled' &&
+            molliePayment.status === PaymentStatus.paid &&
+            !paymentWithSameTransactionId
+        ) {
             Logger.error(
-                `Order '${order.code}' is 'Cancelled'', but was paid for with '${molliePayment.id}'. Payment '${
-                    molliePayment.id
-                }' should be refunded.`,
+                `Order '${order.code}' is 'Cancelled', but was paid for with '${molliePayment.id}'. Payment '${molliePayment.id}' should be refunded.`,
                 loggerCtx,
             );
             return order;
         }
-
         if (!VENDURE_STATES_THAT_REQUIRE_ACTION.includes(order.state)) {
             Logger.info(
                 `Order ${order.code} is already '${order.state}', no need for handling Mollie status '${molliePayment.status}'`,
